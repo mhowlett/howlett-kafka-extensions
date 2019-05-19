@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description></Description>
+    <Copyright>Copyright 2019, project contributors</Copyright>
+    <PackageProjectUrl>https://github.com/mhowlett/howlett-kafka-extensions/</PackageProjectUrl>
+    <PackageLicenseUrl>https://github.com/mhowlett/howlett-kafka-extensions/blob/master/LICENSE.txt</PackageLicenseUrl>
+    <PackageTags>Kafka;Confluent</PackageTags>
+    <PackageId>Howlett.Kafka.Extensions</PackageId>
+    <Title>Howlett.Kafka.Extensions</Title>
+    <AssemblyName>Howlett.Kafka.Extensions</AssemblyName>
+    <VersionPrefix>0.1</VersionPrefix>
+    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+ <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" Version="1.0.0" />
+    <PackageReference Include="Bogus" Version="26.0.2" />
+  </ItemGroup>
+
+</Project>
