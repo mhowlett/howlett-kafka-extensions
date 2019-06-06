@@ -1,6 +1,10 @@
 ## Stateless Stream Processor Example
 
-A multi-purpose console app demonstrating use of the `Processor` class. Usage (kafka broker @ 127.0.0.1:9092):
+A console app demonstrating use of the `Processor` class.
+
+In this example, only one processor executes per process. Run multiple times to execute different processing steps.
+
+Usage:
 
 1. Use the `AdminClient` to (re)create topics `simulated-weblog` and `filtered-weblog`:
 
@@ -28,7 +32,7 @@ dotnet run log 127.0.0.1:9092 1
 
 Notes: 
 
-1. Copy/paste the code & tweak to your own needs. More out-of-the-box flexibility planned. Open an issue with what you need that this can't do.
+1. Copy/paste the code & tweak to your own needs. Open an issue with what you need that this can't do.
 1. High-throughput (100k's messages / s).
 1. At-least once semantics.
-1. Scale by running multiple instances of each step.
+1. Scale horizontally by running multiple instances of each step.

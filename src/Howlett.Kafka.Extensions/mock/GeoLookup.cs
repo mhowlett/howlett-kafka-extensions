@@ -26,8 +26,14 @@ namespace Howlett.Kafka.Extensions.Mock
 
         private static Random random = new Random();
 
-        public static string GetCountryFromIPAsync(string ip)
+        public static string GetCountryFromIP(string ip)
         {
+            return CountriesOrderedByPopulation[r.Next(0, CountriesOrderedByPopulation.Length)];
+        }
+
+        public static async Task<string> GetCountryFromIPAsync(string ip)
+        {
+            await Task.Delay(r.Next(100));
             return CountriesOrderedByPopulation[r.Next(0, CountriesOrderedByPopulation.Length)];
         }
     }

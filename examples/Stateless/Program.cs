@@ -77,7 +77,7 @@ namespace Howlett.Kafka.Extensions.Examples
                                 }
                             }
                         }
-                        await Task.Delay(TimeSpan.FromSeconds(5));
+                        await Task.Delay(TimeSpan.FromSeconds(2));
                         await adminClient.CreateTopicsAsync(topicSpecs);
                     }
                     Console.WriteLine("done.");
@@ -88,6 +88,7 @@ namespace Howlett.Kafka.Extensions.Examples
                     Random r = new Random();
                     var fakeDataSourceProcessor = new Processor<Null, Null, Null, string>
                     {
+                        Name = "fakegen",
                         BootstrapServers = brokerAddress,
                         OutputTopic = simulatedWeblogTopic,
                         Function = (_) =>
@@ -120,7 +121,7 @@ namespace Howlett.Kafka.Extensions.Examples
                                     throw new FormatException("unexpected logline format");
                                 }
                                 var ip = logline.Substring(0, firstSpaceIndex);
-                                var country = MockGeoLookup.GetCountryFromIPAsync(ip);
+                                var country = MockGeoLookup.GetCountryFromIP(ip);
                                 var loglineWithoutIP = logline.Substring(firstSpaceIndex+1);
                                 var dateStart = loglineWithoutIP.IndexOf('[');
                                 var dateEnd = loglineWithoutIP.IndexOf(']');
