@@ -1,0 +1,12 @@
+{
+    "Name": "users",
+    "NumPartitions": 2,
+    "Columns": {
+      "id":        { "Type": "long",   "Unique": true },
+      "username":  { "Type": "string", "Unique": true },
+      "email":     { "Type": "string", "Unique": true },
+      "firstname": { "Type": "string", "Unique": false },
+      "lastname":  { "Type": "string", "Unique": false },
+      "quota":     { "Type": "long",   "Unique": false }
+    }
+}
