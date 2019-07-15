@@ -1,5 +1,6 @@
-﻿using System.Collections.Generic;
-using System.Linq;
+﻿using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -8,35 +9,40 @@ namespace Howlett.Kafka.Extensions.Experiment
     class Program
     {
         static async Task Main(string[] args)
-        {
-            // all tables make topics if not exist.            
+        {         
             var desc = System.IO.File.ReadAllText("/git/howlett-kafka-extensions/experiment/UserTable/tablespec.json");
             var bootstrapServers = "127.0.0.1:9092";
+            var numPartitions = 3;
+            var recreate = true;
 
-            CancellationTokenSource cts = new CancellationTokenSource();
-
-            var uTables = new []
+            using (var table = new Table(desc, bootstrapServers, numPartitions, recreate))
             {
-                new Table(bootstrapServers, desc, 0, cts.Token),
-                new Table(bootstrapServers, desc, 1, cts.Token)
-            }.ToList();
+                var r = await table.Add("id", "42",
+                    new Dictionary<string, string>
+                    {
+                        { "username", "jsmith" },
+                        { "email", "john@smith.org" },
+                        { "quota", "100" },
+                        { "firstname", "John" },
+                        { "lastname", "Smith"}
+                    });
+        
+                // r = await table.Add("id", "43",
+                //     new Dictionary<string, string>
+                //     {
+                //         { "username", "auser" },
+                //         { "email", "auser@gmail.com" },
+                //         { "quota", "200" },
+                //         { "firstname", "Anthony" },
+                //         { "lastname", "User"}
+                //     });
 
-            uTables.ForEach(ut => ut.WaitReady());
+                var user = table.Get("username", "jsmith");
+                Console.WriteLine("\nget jsmith:\n" + JsonConvert.SerializeObject(user, Formatting.Indented));
 
-            await uTables[Table.Partitioner("mhowlett", 2)].AddOrUpdate(
-                ChangeType.Update,
-                "username", "mhowlett",
-                new Dictionary<string, object>
-                {
-                    { "email", "matt@somedomain.com" },
-                    { "quota", 100 }
-                });
-
-            var user = await uTables[Table.Partitioner("mhowlett", 2)].Get("username", "mhowlett");
-
-            Thread.Sleep(10000);
-            cts.Cancel();
-            uTables.ForEach(ut => ut.Dispose());
+                // user = table.Get("username", "auser");
+                // Console.WriteLine("\nget auser:\n" + JsonConvert.SerializeObject(user, Formatting.Indented));
+            }
         }
     }
 }

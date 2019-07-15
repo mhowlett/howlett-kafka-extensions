@@ -1,69 +1,99 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Confluent.Kafka;
 
 
 namespace Howlett.Kafka.Extensions.Experiment
 {
-    public delegate int PartitionerDelegate(object o, int partitionCount);
+    public delegate int PartitionerDelegate(string val, int partitionCount);
 
+    /// <summary>
+    ///     TODO: manage more of the requirements around distributing partitions.
+    /// </summary>
     public class Table : IDisposable
     {
-        public static PartitionerDelegate Partitioner
-            { get => (o, partitionCount) => o.ToString().GetHashCode() % partitionCount; }
+        int numPartitions;
+        CancellationTokenSource cts;
+        List<TablePartition> tablePartitions;
 
-        private Dictionary<string, SubTable> subTables;
-
-        private int partition;
-
-        private TableSpecification tableSpecification;
-
-        public Table(string bootstrapServers, string desc, int partition, CancellationToken ct)
+        public Table(string desc, string bootstrapServers, int numPartitions, bool recreate)
         {
-            this.partition = partition;
-            this.tableSpecification = new TableSpecification(desc);
+            this.numPartitions = numPartitions;
+            CreateTopicsIfRequired(bootstrapServers, desc, numPartitions, recreate);
+            cts = new CancellationTokenSource();
 
-            subTables = new Dictionary<string, SubTable>();
-            foreach (var c in tableSpecification.ColumnSpecifications)
+            tablePartitions = new List<TablePartition>();
+            for (int i=0; i<numPartitions; ++i)
             {
-                if (c.Unique)
+                tablePartitions.Add(new TablePartition(bootstrapServers, desc, i, numPartitions, recreate, cts.Token));
+            };
+
+            Console.WriteLine("waiting for all table partitions to be ready");
+            tablePartitions.ForEach(ut => ut.WaitReady());
+            Console.WriteLine("...ready\n");
+        }
+
+        public Task<bool> Add(string keyName, string keyValue, Dictionary<string, string> row)
+            => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Add(keyName, keyValue, row);
+
+        public Task<bool> Update(string keyName, string keyValue, Dictionary<string, string> row)
+            => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Update(keyName, keyValue, row);
+
+        public Dictionary<string, string> Get(string keyName, string keyValue)
+            => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Get(keyName, keyValue);
+
+        public static PartitionerDelegate Partitioner
+            => (val, partitionCount) =>
                 {
-                    var subTable = new SubTable(tableSpecification, bootstrapServers, c.Name, partition, ct);
-                    subTables.Add(c.Name, subTable);
+                    var bs = Encoding.UTF8.GetBytes(val);
+                    var h = Crc32Provider.ComputeHash(bs, 0, bs.Length);
+                    return (int)(BitConverter.ToUInt32(h) % partitionCount);
+                };
+
+        public static void CreateTopicsIfRequired(string bootstrapServers, string tableSpecification, int numPartitions, bool recreate)
+        {
+            var tableSpec = new TableSpecification(tableSpecification);
+
+            var config = new AdminClientConfig
+            {
+                BootstrapServers = bootstrapServers
+            };
+
+            using (var ac = new Howlett.Kafka.Extensions.AdminClient(config))
+            {
+                foreach (var cs in tableSpec.ColumnSpecifications.Where(a => a.Unique))
+                {
+                    if (recreate)
+                    {
+                        Console.WriteLine($"deleting topics for column {cs.Name}");
+                        ac.DeleteTopicMaybeAsync(tableSpec.ChangeLogTopicName(cs.Name)).GetAwaiter().GetResult();
+                        ac.DeleteTopicMaybeAsync(tableSpec.CommandTopicName(cs.Name)).GetAwaiter().GetResult();
+                        Thread.Sleep(1000);
+                    }
+
+                    ac.CreateTopicMaybeAsync(
+                        tableSpec.ChangeLogTopicName(cs.Name), numPartitions, 1,
+                        new Dictionary<string, string>
+                        {
+                            { "cleanup.policy", "compact" }
+                        }
+                    ).GetAwaiter().GetResult();
+                    
+                    ac.CreateTopicMaybeAsync(
+                        tableSpec.CommandTopicName(cs.Name), numPartitions, 1, null
+                    ).GetAwaiter().GetResult();
                 }
             }
         }
 
-
-        public async Task AddOrUpdate(
-            ChangeType changeType,
-            string keyName, object keyValue,
-            Dictionary<string, object> row)
-        {
-            var subTable = subTables[keyName];
-            await subTable.AddOrUpdate(changeType, keyValue, row);
-        }
-
-        public void WaitReady()
-        {
-            foreach (var st in subTables.Values)
-            {
-                st.WaitReady();
-            }
-        }
-
-        public async Task<Dictionary<string, object>> Get(string keyName, object keyValue)
-        {
-            return null;
-        }
-
         public void Dispose()
         {
-            foreach (var st in subTables.Values)
-            {
-                st.Dispose();
-            }
+            cts.Cancel();
+            tablePartitions.ForEach(ut => ut.Dispose());
         }
     }
 }
