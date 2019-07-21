@@ -7,20 +7,19 @@ In increasing order of sophistication:
 1. Buffering
 2. ETL
 3. Stream Processing
-4. System-Of-Record (?)
+4. System of Record
 
-### Problem
+### System of Record - Limitations
 
-Unique / foreign key constraint capability for materialized data does not come out-of-the-box.
+Unique / foreign key constraint capability for materialized change log data does not come out-of-the-box.
 
 How easy is it to build an abstraction for this purpose? Not trivial.
 
-As a concrete example, consider enforcing unique constraints on users table.
+As a concrete example, consider enforcing more than one unique constraint on a users table.
 
 ```
 {
     "Name": "users",
-    "NumPartitions": 3,
     "Columns": {
       "id":        { "Type": "long",   "Unique": true },
       "username":  { "Type": "string", "Unique": true },
@@ -36,20 +35,28 @@ As a concrete example, consider enforcing unique constraints on users table.
 
 **Why**
 
-- The fewer disparate systems you need to manage, the better.
-- Specific to me: I know more about Kafka than anything other storage system.
+- The fewer disparate systems you need to manage, the better. If you are building an application on top of Kafka, perhaps this will allow you can avoid adding another system to your stack.
+- [specific to me] I know more about Kafka than any database.
+- Perhaps Kafka enables constraints (maybe involving time / ordering) that are useful that are difficult / not possible to achieve with other systems.
 
 **Why Not**
 
-- Other systems will provide similar functionality better. If you're not operating at scale, this approach is not worth considering. If you are, I think it is. 
-    - Question: what are the other options if a horizontally scalable solution is required?
-- High write amplification (in initial design at least).
-- High latency (need to synchonously wait on sequence of events to propagate).
+- Other systems will provide similar functionality, better. Horizontally scalable systems that allow for scalable constraints OOTB include:
+    - [Cockroach Db](https://www.cockroachlabs.com/)
+    - [Vitess](https://vitess.io/)
+    - [YugaByte](http://yugabyte.com/)
+    - [Fauna](https://fauna.com/)
+    - TODO: more?
+- If you don't need horizontal scalabiliy, there are many other highly flexible alternatives: postgres etc.
+- Not hugely performant:
+    - High write amplification (in initial design at least).
+    - High latency (need to synchonously wait on sequence of events to propagate).
+    - But nothing will be - fundamentally difficult problem.
 
 
 ### Implementation
 
-To implement this, we fundamentally need to duplicate the change log data in topics partitioned by each of the unique keys.
+To implement this, change log data fundamentally needs to be duplicated in topics partitioned by each of the unique keys.
 
 Use compacted topic to back a materialized view of each.
 
@@ -98,3 +105,7 @@ TODO
 - That's expensive.
 - If all we care about is not loosing data, data requirements are just triple replication of change log data in some form. with three unique columns, have this via re-partitioning automatically.
     - It would be possible to make this work, but it'd be substantially more complex to implement.
+
+
+
+no unique column is special - which is 'primary' depends on request.

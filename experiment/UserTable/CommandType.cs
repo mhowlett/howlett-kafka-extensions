@@ -10,7 +10,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         /// <summary>
         ///     Send to other columns to inform of the new value.
         /// </summary>
-        Lock,
+        Enter,
 
         /// <summary>
         ///     Columns send this back confirming or not that the value is good to change.
@@ -20,7 +20,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         /// <summary>
         ///     Sent to columns with a locked value to unlock it.
         /// </summary>
-        Unlock,
+        Exit,
 
         /// <summary>
         ///     Sent from the change log consume loop to acknowledge the change.

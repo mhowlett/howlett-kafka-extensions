@@ -1,5 +1,7 @@
+using System.Reactive;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,6 +12,22 @@ using Newtonsoft.Json.Linq;
 
 namespace Howlett.Kafka.Extensions.Experiment
 {
+    public static class AAA 
+    {
+        public static void FailIfFaulted<K,V>(this Task<DeliveryResult<K,V>> task, string facility, string message)
+        {
+            task.ContinueWith(
+            r => 
+            {
+                if (r.IsFaulted)
+                {
+                    Logger.Log(facility, message);
+                    System.Environment.Exit(1);
+                }
+            });
+        }
+    }
+
     public class ColumnPartition : IDisposable
     {
         private TimeSpan defaultTimeoutMs = TimeSpan.FromSeconds(10);
@@ -103,320 +121,450 @@ namespace Howlett.Kafka.Extensions.Experiment
         private Dictionary<string, Dictionary<string, string>> materialized = new Dictionary<string, Dictionary<string, string>>();
 
         // correlation: WaitingForVerify info.
-        private Dictionary<string, WaitingForVerify> waitingVerify = new Dictionary<string, WaitingForVerify>();
-
-        // correlation: WaitingForMaterialized info.
-        private Dictionary<string, WaitingForAck> waitingMaterialized = new Dictionary<string, WaitingForAck>();
+        private Dictionary<string, InProgressState> inProgressState = new Dictionary<string, InProgressState>();
 
         // columnValue: correlation. correlation allows for de-duping.
         private Dictionary<string, string> locked = new Dictionary<string, string>();
 
         // Waiting requests that are being awaited.
-        private Dictionary<string, WaitingForResult> waitingResult = new Dictionary<string, WaitingForResult>();
+        private Dictionary<string, InProgressTask> inProgressTasks = new Dictionary<string, InProgressTask>();
 
+        private SortedList<long, string> blockedForCommit = new SortedList<long, string>();
 
-        private void HandleChange(JObject o)
+        /// <summary>
+        ///     Complete the method call.
+        /// </summary>
+        private void CompleteChangeRequest(string correlation, Exception exception)
         {
-            var changeType = (AddOrUpdate)o.GetValue("ChangeType").Value<int>();
-            var columnValue = o.GetValue("ColumnValue").Value<string>();
-            var correlation = o.GetValue("Correlation").Value<string>();
-            var data = (JObject)o.GetValue("Data");
-
-            var colId = String.Format("{0,15}", $"[{this.columnName}|{this.partition}]");
-            var begin = $"{colId} CHANGE  {columnValue}";
-            var line = String.Format("{0,-60} .." + correlation.Substring(correlation.Length-8), begin);
-            Console.WriteLine(line);
-
-            if (waitingVerify.ContainsKey(correlation))
+            Task.Run(() => 
             {
-                Console.WriteLine($"de-dupe change command {correlation}");
+                lock (inProgressTasks)
+                {
+                    var wr = inProgressTasks[correlation];
+                    if (wr != null)
+                    {
+                        inProgressTasks.Remove(correlation);
+                        if (exception == null)
+                        {
+                            wr.TaskCompletionSource.SetResult(true);
+                        }
+                        else
+                        {
+                            wr.TaskCompletionSource.SetException(exception);
+                        }
+                    }
+                    else
+                    {
+                        Logger.Log("COMPLETE", $"No task to complete for command [{correlation}]");
+                    }
+                }
+            });
+        }
+
+
+        /// <summary>
+        ///     Handle a brand new add or update command.
+        /// </summary>
+        private void HandleChange(Command_Change cmd, Offset offset)
+        {
+            if (inProgressState.ContainsKey(cmd.Correlation))
+            {
+                // if the command_change message is received more than once, this is a duplicate
+                // message in the log and can simply be ignored.
+                Logger.Log("CHANGE", $"ignoring duplicate change command [{cmd.Correlation}]");
                 return;
             }
-            
-            Dictionary<string, string> dataAsDict = new Dictionary<string, string>();
-            foreach (var v in data.Descendants())
+
+            // if the column value is locked, then fail the command immediately.
+            if (locked.ContainsKey(cmd.ColumnValue))
             {
-                if (v.GetType() != typeof(JProperty)) continue;
-                dataAsDict.Add(((JProperty)v).Name, ((JProperty)v).Value.ToString());
+                CompleteChangeRequest(cmd.Correlation, new Exception($"key {cmd.ColumnValue} locked, can't change [{cmd.Correlation}]"));
+                return;
             }
 
-            Dictionary<string, string> oldData = null;
+            // also abort if this is an add operation and the value exists already.
+            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.AddOrUpdate.Add &&
+                this.materialized.ContainsKey(cmd.ColumnValue))
+            {
+                CompleteChangeRequest(cmd.Correlation,new Exception($"key {cmd.ColumnValue} exists, can't add [{cmd.Correlation}]"));
+                return;
+            }
 
-            // keep track of the columns we're waiting for verify from.
-            waitingVerify.Add(correlation, new WaitingForVerify
+            // also abort if this is an update operation and the value doesn't exist already.
+            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.AddOrUpdate.Update &&
+                !this.materialized.ContainsKey(cmd.ColumnValue))
+            {
+                CompleteChangeRequest(cmd.Correlation, new Exception($"key {cmd.ColumnValue} doesn't exists, can't update [{cmd.Correlation}]"));
+                return;
+            }
+
+            // AddOrUpdate can be dis-ambiguated at this point, and is not considered further
+            // in the workflow.
+            var isAddCommand = !materialized.ContainsKey(cmd.ColumnValue) || cmd.ChangeType == Experiment.AddOrUpdate.Add;
+
+            var amalgamatedData = new Dictionary<string, string>(cmd.Data);
+            var uniqueColumnValuesToDelete = new Dictionary<string, string>();
+
+            // if this is an update:
+            if (!isAddCommand)
+            {
+                // 1. amalgamate with existing data.
+                var existing = materialized[cmd.ColumnValue];
+                foreach (var e in existing)
+                {
+                    if (!amalgamatedData.ContainsKey(e.Key))
+                    {
+                        amalgamatedData.Add(e.Key, e.Value);
+                    }
+                }
+
+                // 2. work out unique values (other than this) that have changed -
+                //    we need the old values to be removed.
+                // 
+                //    notes:
+                //     1. the current partition column value can't have changed (obviously)
+                //     2. even if a unique column value hasn't changed, it
+                //        needs to get locked (be included in the operation workflow)
+                //        because it's data is changing.
+                foreach (var other in this.otherUniqueColumns)
+                {
+                    if (cmd.Data.ContainsKey(other.Name))
+                    {
+                        if (cmd.Data[other.Name] != materialized[cmd.ColumnValue][other.Name])
+                        {
+                            uniqueColumnValuesToDelete.Add(other.Name, cmd.Data[other.Name]);
+                        }
+                    }
+                }
+            }
+        
+            // check that all unique columns have a value.
+            foreach (var other in this.otherUniqueColumns)
+            {
+                if (!amalgamatedData.ContainsKey(other.Name))
+                {
+                    CompleteChangeRequest(cmd.Correlation, new Exception("change request does not contain value for key {other.Name} [{cmd.Correlation}]"));
+                    return;
+                }
+            }
+
+            // lock this column's value - at this point, we're going to try and apply the change.
+            locked.Add(cmd.ColumnValue, cmd.Correlation);
+
+            // prevent a commit of this offset until the final write in the workflow is done.
+            blockedForCommit.Add(offset, cmd.Correlation);
+
+            // keep track of info related to this command including the columns we'll be waiting for a verify from.
+            var otherList = otherUniqueColumns
+                .Select(a => new KeyValuePair<string, string>(a.Name, amalgamatedData[a.Name]))
+                .Concat(uniqueColumnValuesToDelete.ToList())
+                .Select(a => new NameAndValue { Name = a.Key, Value = a.Value })
+                .ToList();
+            inProgressState.Add(cmd.Correlation, new InProgressState
                 { 
-                    ColumnValue = columnValue,
-                    OtherColumns = otherUniqueColumns.Select(a => a.Name).ToList(),
-                    NewData = dataAsDict,
-                    OldData = oldData,
+                    ChangeCommandOffset = offset,
+                    ColumnValue = cmd.ColumnValue,
+                    WaitingVerify = otherList,
+                    WaitingAck = otherList,
+                    Data = amalgamatedData,
+                    ToDelete = uniqueColumnValuesToDelete,
+                    ToSet = otherUniqueColumns.Select(a => new KeyValuePair<string, string>(a.Name, amalgamatedData[a.Name])).ToDictionary(a => a.Key, a => a.Value),
+                    Verified = true // results from other column partitions get &'d together.
                 });
 
-            // implicit lock command on this columns value.
-            locked.Add(columnValue, correlation);
-
-            foreach (var cs in otherUniqueColumns)
+            // finally, send an enter command to the relevant key/values
+            // that need locking.
+            foreach (var cs in inProgressState[cmd.Correlation].WaitingVerify)
             {
-                var v = data.GetValue(cs.Name).Value<string>();
-
-                var lockCommand = new Command_Lock
+                var enterCommand = new Command_Enter
                 {
-                    Correlation = correlation,
-                    ChangeType = changeType,
-                    ColumnValue = v,
+                    Correlation = cmd.Correlation,
+                    IsAddCommand = isAddCommand,
+                    ColumnValue = cs.Value,
                     SourceColumnName = this.columnName,
-                    SourceColumnPartition = this.partition
+                    SourceColumnValue = cmd.ColumnValue
                 };
 
                 var tp = new TopicPartition(
                     tableSpecification.CommandTopicName(cs.Name),
-                    Table.Partitioner(v, numPartitions)
+                    Table.Partitioner(cs.Value, numPartitions)
                 );
-                // producer settings ensure in order, gapless produce.
-                cmdProducer.ProduceAsync(
-                    tp,
-                    new Message<Null, string>
-                    {
-                        Value = JsonConvert.SerializeObject(lockCommand, Formatting.Indented)
-                    }
-                ).ContinueWith(r =>
-                    {
-                        // if there's a problem, require a process restart.
-                        if (r.IsFaulted)
-                        {
-                            Console.WriteLine("Fatal error");
-                            System.Environment.Exit(1);
-                        }
-                    });
+
+                // TODO: verify producer settings ensure in order, gapless produce.
+                //       with a long retry.
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(enterCommand, Formatting.Indented) })
+                    .FailIfFaulted("CHANGE", $"A fatal problem occured writing a lock command.");
             }
         }
 
-        private void HandleLock(JObject o)
+        private void HandleEnter(Command_Enter cmd, Offset offset)
         {
-            var changeType = (AddOrUpdate)o.GetValue("ChangeType").Value<int>();
-            var columnValue = o.GetValue("ColumnValue").Value<string>();
-            var correlation = o.GetValue("Correlation").Value<string>();
-            var sourceColumnName = o.GetValue("SourceColumnName").Value<string>();
-            var SourceColumnPartition = o.GetValue("SourceColumnPartition").Value<int>();
-
-            var colId = String.Format("{0,15}", $"[{this.columnName}|{this.partition}]");
-            var begin = $"{colId} LOCK    {columnValue}";
-            var line = String.Format("{0,-60} .." + correlation.Substring(correlation.Length-8), begin);
-            Console.WriteLine(line);
-
-            // TODO: check correlation.
-
             bool canChange = true;
-            if (locked.ContainsKey(columnValue))
+
+            // deal with case where value is locked already.
+            if (locked.ContainsKey(cmd.ColumnValue))
             {
-                if (locked[columnValue] != correlation) // dedupe.
+                if (locked[cmd.ColumnValue] != cmd.Correlation) // dedupe.
                 {
-                    // if key is already locked, cannot acquire lock again.
+                    Logger.Log("ENTER", $"Duplicate lock command received, ignoring [{cmd.Correlation}]");
+                    return;
+                }
+                else
+                {
+                    Logger.Log("ENTER", $"Attempting to lock key that is already locked: blocking the change operation [{cmd.Correlation}]");
                     canChange = false;
                 }
             }
-            else if (materialized.ContainsKey(columnValue) && changeType == Experiment.AddOrUpdate.Add)
+
+            // deal with case where value is already materialized.
+            if (materialized.ContainsKey(cmd.ColumnValue))
             {
-                // if this is not an update, then can't overwrite existing value.
-                canChange = false;
+                if(cmd.IsAddCommand)
+                {
+                    Logger.Log("ENTER", $"Attempting to add a new row with unique column '{this.columnName}' value '{cmd.ColumnValue}' that already exists. [{cmd.Correlation}]");
+                    canChange = false;
+                }
+
+                if (!cmd.IsAddCommand)
+                {
+                    // in the case of an update, it is fine for the key to exist, if the row corresponds to the one being updated.
+                    if (materialized[cmd.ColumnValue][cmd.SourceColumnName] != cmd.SourceColumnValue)
+                    {
+                        Logger.Log("ENTER", $"Attempting to update a row with unique column '{this.columnName}' value '{cmd.ColumnValue}' that already exists for some other row. [{cmd.Correlation}]");
+                        canChange = false;
+                    }
+                }
             }
 
             var verifyCommand = new Command_Verify
             {
-                Correlation = correlation,
+                Correlation = cmd.Correlation,
                 Verified = canChange,
-                SourceColumnName = this.columnName
+                SourceColumnName = this.columnName,
+                SourceColumnValue = cmd.ColumnValue
             };
 
-            var tp = new TopicPartition(tableSpecification.CommandTopicName(sourceColumnName), SourceColumnPartition);
-            cmdProducer.ProduceAsync(
-                tp,
-                new Message<Null, string>
-                {
-                    Value = JsonConvert.SerializeObject(verifyCommand, Formatting.Indented)
-                }
-            ).ContinueWith(r => 
-                {
-                    if (r.IsFaulted)
-                    {
-                        Console.WriteLine("produce failed");
-                        System.Environment.Exit(1);
-                    }
-                });
+            var tp = new TopicPartition(
+                tableSpecification.CommandTopicName(cmd.SourceColumnName),
+                Table.Partitioner(cmd.SourceColumnValue, numPartitions));
 
-            locked.Add(columnValue, correlation);
+            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(verifyCommand, Formatting.Indented) })
+                .FailIfFaulted("ENTER", $"A fatal problem occured writing a verify command.");
+
+            locked.Add(cmd.ColumnValue, cmd.Correlation);
+
+            // don't allow commit until exit.
+            blockedForCommit.Add(offset, cmd.Correlation);
         }
 
-        private void HandleVerify(JObject o)
+
+        private void HandleVerify(Command_Verify cmd, Offset offset)
         {
-            var correlation = o.GetValue("Correlation").Value<string>();
-            var sourceColumnName = o.GetValue("SourceColumnName").Value<string>();
-            var verified = o.GetValue("Verified").Value<bool>();
-
-            var colId = String.Format("{0,15}", $"[{this.columnName}|{this.partition}]");
-            var begin = $"{colId} VERIFY  {sourceColumnName}";
-            var line = String.Format("{0,-60} .." + correlation.Substring(correlation.Length-8), begin);
-            Console.WriteLine(line);
-
-            if (!waitingVerify.ContainsKey(correlation))
+            if (!inProgressState.ContainsKey(cmd.Correlation))
             {
                 // This could occur in the case of duplicate writes and can be safely ignored.
-                Console.WriteLine("un-expected correlation");
+                Logger.Log("VERIFY", $"Received verify command with no corresponding waitingVerify entry, ignoring [{cmd.Correlation}]");
                 return;
             }
 
-            if (verified == false)
+            // all verify results must be true for command to succeed.
+            inProgressState[cmd.Correlation].Verified &= cmd.Verified;
+
+            // remove the received column from list we're waiting on.
+            inProgressState[cmd.Correlation].WaitingVerify = inProgressState[cmd.Correlation]
+                .WaitingVerify.Where(a => !(a.Name == cmd.SourceColumnName && a.Value == cmd.SourceColumnValue))
+                .ToList();
+
+            // if we're waiting on more, then there's nothing left to do here.
+            if (inProgressState[cmd.Correlation].WaitingVerify.Count > 0)
             {
-                waitingVerify[correlation].Verified = false;
+                return;
             }
-            
-            var wl = waitingVerify[correlation].OtherColumns.Where(a => a != sourceColumnName).ToList();
 
-            // Verification result received for all columns.
-            if (wl.Count == 0)
+
+            // --- verification result has been received for all columns.
+            // Logger.Log("VERIFY", $"All verify commands received for: [{cmd.Correlation}]");
+
+            var inProgress = inProgressState[cmd.Correlation];
+
+
+            // send exit commands for columns that are to be set (or abort).
+            foreach (var col in inProgress.ToSet)
             {
-                var columnValue = waitingVerify[correlation].ColumnValue;
-
-                //   1. commit new changes values to change logs.
-
-                var dataRow = waitingVerify[correlation].NewData;
-
-                // TODO: It's not ideal that these stay forever in the changelog topic.
-                dataRow.Add("_correlation", correlation);
-                dataRow.Add("_sourceColumn", this.columnName);
-                dataRow.Add("_sourceValue", columnValue);
-
-                var tasks = new List<Task<DeliveryResult<string, string>>>();
-
-                var tp = new TopicPartition(
-                        this.tableSpecification.ChangeLogTopicName(this.columnName),
-                        Table.Partitioner(columnValue, this.numPartitions));
-                tasks.Add(clProducer.ProduceAsync(
-                    tp,
-                    new Message<string, string>
-                    {
-                        Key = columnValue,
-                        Value = JsonConvert.SerializeObject(dataRow, Formatting.Indented)
-                    }
-                ));
-
-                foreach (var col in otherUniqueColumns)
+                Dictionary<string, string> dataToSet = null;
+                if (inProgressState[cmd.Correlation].Verified)
                 {
-                    tp = new TopicPartition(
-                        this.tableSpecification.ChangeLogTopicName(col.Name),
-                        Table.Partitioner(dataRow[col.Name], this.numPartitions));
-                    var dr = dataRow.Select(a => a).ToDictionary(a => a.Key, a => a.Value);   // copy
-                    dr.Add(this.columnName, columnValue);
-                    var cVal = dr[col.Name];
-                    dr.Remove(col.Name);
-
-                    tasks.Add(clProducer.ProduceAsync(
-                        tp,
-                        new Message<string, string>
-                        {
-                            Key = cVal,
-                            Value = JsonConvert.SerializeObject(dr, Formatting.Indented)
-                        }
-                    ));
+                    dataToSet = new Dictionary<string, string>(inProgress.Data);
+                    dataToSet.Add(this.columnName, inProgress.ColumnValue);
+                    dataToSet.Remove(col.Key);
                 }
 
-                //  2. if this is an update, remove old values from change log.
-                //  TODO:
-
-
-                //   3. write unlock commands as required. Note: change has already been sent to changelog topic.
-
-                Task.WhenAll(tasks).ContinueWith(r => 
+                var exitCommand = new Command_Exit
                 {
-                    if (r.IsFaulted)
-                    {
-                        Console.WriteLine("fatal");
-                        System.Environment.Exit(1);
-                    }
+                    Correlation = cmd.Correlation,
+                    ColumnValue = inProgress.Data[col.Key],
+                    Action = inProgress.Verified ? ActionType.Set : ActionType.Abort,
+                    Data = dataToSet,
+                    SourceColumnName = this.columnName,
+                    SourceColumnValue = inProgress.ColumnValue
+                };
 
-                    foreach (var col in otherUniqueColumns)
-                    {
-                        var unlockCommand = new Command_Unlock
-                        {
-                            Correlation = correlation,
-                            ColumnValue = dataRow[col.Name]
-                        };
+                var tp = new TopicPartition(
+                    tableSpecification.CommandTopicName(col.Key),
+                    Table.Partitioner(exitCommand.ColumnValue, this.numPartitions));
 
-                        tp = new TopicPartition(
-                            tableSpecification.CommandTopicName(col.Name),
-                            Table.Partitioner(unlockCommand.ColumnValue, this.numPartitions));
-
-                        cmdProducer.ProduceAsync(
-                            tp,
-                            new Message<Null, string>
-                            {
-                                Value = JsonConvert.SerializeObject(unlockCommand, Formatting.Indented)
-                            }
-                        ).ContinueWith(r => 
-                            {
-                                if (r.IsFaulted)
-                                {
-                                    Console.WriteLine("produce failed");
-                                    System.Environment.Exit(1);
-                                }
-                            });
-                    }
-
-                    lock (waitingResult)
-                    {
-                        waitingResult[correlation].Verified = waitingVerify[correlation].Verified;
-                    }
-
-                    waitingVerify.Remove(correlation);
-                });
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented) })
+                    .FailIfFaulted("VERIFY", "produce fail");
             }
-            else
+        
+            // send exit commands for column values that are to be deleted (or abort).
+            foreach (var col in inProgress.ToDelete)
             {
-                waitingVerify[correlation].OtherColumns = wl;
+                var exitCommand = new Command_Exit
+                {
+                    Correlation = cmd.Correlation,
+                    ColumnValue = inProgress.Data[col.Key],
+                    Action = inProgress.Verified ? ActionType.Delete : ActionType.Abort,
+                    Data = null,
+                    SourceColumnName = this.columnName,
+                    SourceColumnValue = inProgress.ColumnValue
+                };
+
+                var tp = new TopicPartition(
+                    tableSpecification.CommandTopicName(col.Key),
+                    Table.Partitioner(exitCommand.ColumnValue, this.numPartitions));
+
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented) })
+                    .FailIfFaulted("VERIFY", "produce fail");
+            }
+
+            // if aborting, complete now - there will be no acks.
+            if (!inProgressState[cmd.Correlation].Verified)
+            {
+                CompleteChangeRequest(cmd.Correlation, new Exception("columns verify failed"));
+                inProgressState.Remove(cmd.Correlation);
+                return;
             }
         }
 
-        private void HandleUnlock(JObject o)
+        private void HandleExit(Command_Exit cmd, Offset offset)
         {
-            var correlation = o.GetValue("Correlation").Value<string>();
-            var columnValue = o.GetValue("ColumnValue").Value<string>();
-
-            var colId = String.Format("{0,15}", $"[{this.columnName}|{this.partition}]");
-            var begin = $"{colId} UNLOCK  {columnValue}";
-            var line = String.Format("{0,-60} .." + correlation.Substring(correlation.Length-8), begin);
-            Console.WriteLine(line);
-
-            if (locked.ContainsKey(columnValue))
+            if (locked.ContainsKey(cmd.ColumnValue))
             {
-                if (locked[columnValue] != correlation)
+                if (locked[cmd.ColumnValue] != cmd.Correlation)
                 {
-                    Console.WriteLine("correlation doesn't match, unlocking.");
+                    Logger.Log("EXIT", "correlation doesn't match, unlocking. [{cmd.Correlation}]. expecting: [{locked[cmd.ColumnValue]}]");
                     System.Environment.Exit(1);
                 }
             }
 
-            locked.Remove(columnValue);
-        }
+            // after this handler, the value is no longer locked
+            locked.Remove(cmd.ColumnValue);
+            // also, offset is free to progress.
+            blockedForCommit.Remove(offset);
 
-        private void HandleAck(JObject o)
-        {
-            var correlation = o.GetValue("Correlation").Value<string>();
-            var sourceColumnName = o.GetValue("SourceColumnName").Value<string>();
+            // if the command is aborting, then no ack is expected and we're done.
+            if (cmd.Action == ActionType.Abort)
+            {
+                Logger.Log("EXIT", "Command aborted [{cmd.Correlation}]");
+                return;
+            }
 
-            var colId = String.Format("{0,15}", $"[{this.columnName}|{this.partition}]");
-            var begin = $"{colId} ACK     {sourceColumnName}";
-            var line = String.Format("{0,-60} .." + correlation.Substring(correlation.Length-8), begin);
-            Console.WriteLine(line);
+            // 1. commit new changes values to change logs.
 
-            Task.Run(() => 
+            var tp = new TopicPartition(
+                    this.tableSpecification.ChangeLogTopicName(this.columnName),
+                    Table.Partitioner(cmd.ColumnValue, this.numPartitions));
+
+            if (cmd.Action == ActionType.Set)
+            {
+                clProducer.ProduceAsync(tp, new Message<string, string> { Key = cmd.ColumnValue, Value = JsonConvert.SerializeObject(cmd.Data, Formatting.Indented) })
+                    .FailIfFaulted("EXIT", "failed to write to changelog");
+
+                if (materialized.ContainsKey(cmd.ColumnValue))
                 {
-                    lock (waitingResult)
-                    {
-                        var wr = waitingResult[correlation];
-                        waitingResult.Remove(correlation);
-                        wr.TaskCompletionSource.SetResult(wr.Verified);
-                    }
-                });
+                    materialized[cmd.ColumnValue] = cmd.Data;
+                }
+                else
+                {
+                    materialized.Add(cmd.ColumnValue, cmd.Data);
+                }
+            }
+            else if (cmd.Action == ActionType.Delete)
+            {
+                clProducer.ProduceAsync(tp, new Message<string, string> { Key = cmd.ColumnValue, Value = null })
+                    .FailIfFaulted("EXIT", "failed to write tombstone to changelog");
+
+                if (materialized.ContainsKey(cmd.ColumnValue))
+                {
+                    materialized.Remove(cmd.ColumnValue);
+                }
+                else
+                {
+                    Logger.Log("EXIT", "Expecting value to exist in materialized table [{cmd.Correlation}]");
+                }
+            }
+
+            // 2. send ack commands back.
+
+            var ackCommand = new Command_Ack
+            {
+                Correlation = cmd.Correlation,
+                SourceColumnName = this.columnName,
+                SourceColumnValue = cmd.ColumnValue
+            };
+            
+            tp = new TopicPartition(
+                this.tableSpecification.CommandTopicName(cmd.SourceColumnName),
+                Table.Partitioner(cmd.SourceColumnValue, this.numPartitions));
+
+            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(ackCommand, Formatting.Indented) })
+                .FailIfFaulted("EXIT", "failed to write ack cmd [{cmd.Correlation}]");
         }
+
+
+        private void HandleAck(Command_Ack cmd, Offset offset)
+        {
+            // always expect the state corresponding to an ack to exist.
+            if (!this.inProgressState.ContainsKey(cmd.Correlation))
+            {
+                Logger.Log("ACK", $"ERROR!: Ack correlation not found [{cmd.Correlation}]");
+
+                // if the task is known, then that is also unexpected. fail the task with an internal error.
+                if (this.inProgressTasks.ContainsKey(cmd.Correlation))
+                {
+                    CompleteChangeRequest(cmd.Correlation, new Exception($"Ack correlation not found [{cmd.Correlation}]"));
+                }
+
+                return;
+            }
+
+            var inProgress = this.inProgressState[cmd.Correlation];
+
+            // it's ok if this doesn't exist - may reflect a de-dupe.
+            if (inProgress.WaitingAck.Where(a => a.Name == cmd.SourceColumnName && a.Value == cmd.SourceColumnValue).Count() == 1)
+            {
+                inProgress.WaitingAck = inProgress
+                    .WaitingAck.Where(a => !(a.Name == cmd.SourceColumnName && a.Value == cmd.SourceColumnValue))
+                    .ToList();
+            }
+            else
+            {
+                Logger.Log("ACK", $"ack received, but not waiting for it {cmd.SourceColumnName}, {cmd.SourceColumnValue} [{cmd.Correlation}]");
+            }
+
+            if (inProgress.WaitingAck.Count != 0)
+            {
+                return;
+            }
+
+            locked.Remove(inProgress.ColumnValue);
+            blockedForCommit.Remove(offset);
+            this.inProgressState.Remove(cmd.Correlation);
+
+            CompleteChangeRequest(cmd.Correlation, null);
+        }
+
 
         private Thread _noCollect; 
         private void StartCommandConsumer(CancellationToken ct)
@@ -425,8 +573,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             {
                 try
                 {
-                    // var tp = new TopicPartition(this.tableSpecification.CommandTopicName(this.columnName), this.partition);
-                    // commandConsumer.Assign(tp);
+                    // the partitions assigned handler does a stacking assignment.
                     commandConsumer.Subscribe(this.tableSpecification.CommandTopicName(this.columnName));
 
                     while (!ct.IsCancellationRequested)
@@ -439,26 +586,27 @@ namespace Howlett.Kafka.Extensions.Experiment
                         commandConsumer.Commit(cr);
 
                         var o = (JObject)JsonConvert.DeserializeObject(cr.Value);
-                        var commandType = (CommandType)o.GetValue("CommandType").Value<int>();
-                        switch(commandType)
+                        var cmd = Command.Extract(o);
+                        Command.Log(cmd, this.columnName, this.partition);
+                        switch(cmd.CommandType)
                         {
                             case CommandType.Change:
-                                HandleChange(o);
+                                HandleChange((Command_Change)cmd, cr.Offset);
                                 break;
-                            case CommandType.Lock:
-                                HandleLock(o);
+                            case CommandType.Enter:
+                                HandleEnter((Command_Enter)cmd, cr.Offset);
                                 break;
                             case CommandType.Verify:
-                                HandleVerify(o);
+                                HandleVerify((Command_Verify)cmd, cr.Offset);
                                 break;
-                            case CommandType.Unlock:
-                                HandleUnlock(o);
+                            case CommandType.Exit:
+                                HandleExit((Command_Exit)cmd, cr.Offset);
                                 break;
                             case CommandType.Ack:
-                                HandleAck(o);
+                                HandleAck((Command_Ack)cmd, cr.Offset);
                                 break;
                             default:
-                                Console.WriteLine($"Unknown command type: {commandType}");
+                                Console.WriteLine($"Unknown command type: {cmd.CommandType}");
                                 break;
                         }
                     }
@@ -560,9 +708,9 @@ namespace Howlett.Kafka.Extensions.Experiment
         public async Task<bool> WaitForResult(string correlation)
         {
             TaskCompletionSource<bool> tcs = new TaskCompletionSource<bool>();
-            lock (waitingResult)
+            lock (inProgressTasks)
             {
-                waitingResult.Add(correlation, new WaitingForResult { TaskCompletionSource = tcs });
+                inProgressTasks.Add(correlation, new InProgressTask { TaskCompletionSource = tcs });
             }
             return await tcs.Task.ConfigureAwait(false);
         }

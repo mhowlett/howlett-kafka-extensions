@@ -37,7 +37,7 @@ namespace Howlett.Kafka.Extensions.Experiment
 
 
         public async Task<bool> Update(string keyName, string keyValue, Dictionary<string, string> row)
-            => await columns[keyName].AddOrUpdate(AddOrUpdate.Update, keyValue, row);
+            => await columns[keyName].AddOrUpdate(AddOrUpdate.AddOrUpdate, keyValue, row);
 
 
         public void WaitReady()
