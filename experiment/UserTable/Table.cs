@@ -12,7 +12,9 @@ namespace Howlett.Kafka.Extensions.Experiment
     public delegate int PartitionerDelegate(string val, int partitionCount);
 
     /// <summary>
-    ///     TODO: manage more of the requirements around distributing partitions.
+    ///     A helper class to facilitate running multiple table partitions.
+    /// 
+    ///     TODO: Some abstractions to help use in a distributed setting.
     /// </summary>
     public class Table : IDisposable
     {
@@ -20,7 +22,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         CancellationTokenSource cts;
         List<TablePartition> tablePartitions;
 
-        public Table(string desc, string bootstrapServers, int numPartitions, bool recreate)
+        public Table(string desc, string bootstrapServers, int numPartitions, bool recreate, bool logCommands)
         {
             this.numPartitions = numPartitions;
             CreateTopicsIfRequired(bootstrapServers, desc, numPartitions, recreate);
@@ -29,7 +31,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             tablePartitions = new List<TablePartition>();
             for (int i=0; i<numPartitions; ++i)
             {
-                tablePartitions.Add(new TablePartition(bootstrapServers, desc, i, numPartitions, recreate, cts.Token));
+                tablePartitions.Add(new TablePartition(bootstrapServers, desc, i, numPartitions, recreate, logCommands, cts.Token));
             };
 
             Console.WriteLine("waiting for all table partitions to be ready");
@@ -43,8 +45,17 @@ namespace Howlett.Kafka.Extensions.Experiment
         public Task<bool> Update(string keyName, string keyValue, Dictionary<string, string> row)
             => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Update(keyName, keyValue, row);
 
+        public Task<bool> AddOrUpdate(string keyName, string keyValue, Dictionary<string, string> row)
+            => tablePartitions[Table.Partitioner(keyValue, numPartitions)].AddOrUpdate(keyName, keyValue, row);
+
+        public Task<bool> Delete(string keyName, string keyValue)
+            => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Delete(keyName, keyValue);
+
         public Dictionary<string, string> Get(string keyName, string keyValue)
             => tablePartitions[Table.Partitioner(keyValue, numPartitions)].Get(keyName, keyValue);
+
+        public List<Dictionary<string, string>> GetMetrics()
+            => tablePartitions.Select(tp => tp.GetMetrics()).SelectMany(a => a).ToList();
 
         public static PartitionerDelegate Partitioner
             => (val, partitionCount) =>

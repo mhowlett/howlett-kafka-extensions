@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Confluent.Kafka;
 
 
 namespace Howlett.Kafka.Extensions.Experiment
@@ -15,7 +15,14 @@ namespace Howlett.Kafka.Extensions.Experiment
 
         private TableSpecification tableSpecification;
 
-        public TablePartition(string bootstrapServers, string tableSpec, int partition, int numPartitions, bool recreate, CancellationToken ct)
+        public TablePartition(
+            string bootstrapServers,
+            string tableSpec,
+            int partition,
+            int numPartitions,
+            bool recreate,
+            bool logCommands,
+            CancellationToken ct)
         {
             this.partition = partition;
             this.tableSpecification = new TableSpecification(tableSpec);
@@ -25,29 +32,23 @@ namespace Howlett.Kafka.Extensions.Experiment
             {
                 if (c.Unique)
                 {
-                    var column = new ColumnPartition(tableSpecification, bootstrapServers, c.Name, partition, numPartitions, recreate, ct);
+                    var column = new ColumnPartition(tableSpecification, bootstrapServers, c.Name, partition, numPartitions, recreate, logCommands, ct);
                     columns.Add(c.Name, column);
                 }
             }
         }
 
+        public Task<bool> Add(string keyName, string keyValue, Dictionary<string, string> row)
+            => columns[keyName].Change(Experiment.ChangeType.Add, keyValue, row);
 
-        public async Task<bool> Add(string keyName, string keyValue, Dictionary<string, string> row)
-            => await columns[keyName].AddOrUpdate(AddOrUpdate.Add, keyValue, row);
+        public Task<bool> Update(string keyName, string keyValue, Dictionary<string, string> row)
+            => columns[keyName].Change(Experiment.ChangeType.Update, keyValue, row);
 
-
-        public async Task<bool> Update(string keyName, string keyValue, Dictionary<string, string> row)
-            => await columns[keyName].AddOrUpdate(AddOrUpdate.AddOrUpdate, keyValue, row);
-
-
-        public void WaitReady()
-        {
-            foreach (var st in columns.Values)
-            {
-                st.WaitReady();
-            }
-        }
-
+        public Task<bool> AddOrUpdate(string keyName, string keyValue, Dictionary<string, string> row)
+            => columns[keyName].Change(Experiment.ChangeType.AddOrUpdate, keyValue, row);
+            
+        public Task<bool> Delete(string keyName, string keyValue)
+            => columns[keyName].Change(Experiment.ChangeType.Delete, keyValue, null);
 
         public Dictionary<string, string> Get(string keyName, string keyValue)
         {
@@ -59,12 +60,17 @@ namespace Howlett.Kafka.Extensions.Experiment
             return this.columns[keyName].Get(keyValue);
         }
 
+        public List<Dictionary<string, string>> GetMetrics()
+            => columns.Values.ToList().Select(a => a.GetMetrics()).ToList();
+
+        public void WaitReady()
+        {
+            columns.Values.ToList().ForEach(c => c.WaitReady());
+        }
+
         public void Dispose()
         {
-            foreach (var st in columns.Values)
-            {
-                st.Dispose();
-            }
+            columns.Values.ToList().ForEach(c => c.Dispose());
         }
     }
 }

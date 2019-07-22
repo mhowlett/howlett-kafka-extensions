@@ -1,0 +1,10 @@
+{
+    "Name": "employees",
+    "Columns": {
+      "id":        { "Unique": true },
+      "email":     { "Unique": true },
+      "firstname": { "Unique": false },
+      "lastname":  { "Unique": false },
+      "manager":   { "Unique": false, "References": "id" }
+    }
+}

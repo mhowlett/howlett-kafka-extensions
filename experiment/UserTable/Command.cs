@@ -16,11 +16,11 @@ namespace Howlett.Kafka.Extensions.Experiment
 
             var summary = c switch
             {
-                Command_Change cmd => $"{colId} CHANGE  {cmd.ColumnValue}",
+                Command_Change cmd => $"{colId} CHANGE  {cmd.ColumnValue} | {cmd.ChangeType}",
                 Command_Enter cmd =>  $"{colId} ENTER   {cmd.ColumnValue}",
-                Command_Verify cmd => $"{colId} VERIFY  {cmd.SourceColumnName}",
+                Command_Verify cmd => $"{colId} VERIFY  {cmd.SourceColumnName} | {cmd.SourceColumnValue}",
                 Command_Exit cmd =>   $"{colId} EXIT    {cmd.ColumnValue}",
-                Command_Ack cmd =>    $"{colId} ACK     {cmd.SourceColumnName}",
+                Command_Ack cmd =>    $"{colId} ACK     {cmd.SourceColumnName} | {cmd.SourceColumnValue}",
                 _ => $"unknown command"
             };
 
@@ -37,7 +37,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             {
                 case CommandType.Change:
                     {
-                        var changeType = (AddOrUpdate)o.GetValue("ChangeType").Value<int>();
+                        var changeType = (ChangeType)o.GetValue("ChangeType").Value<int>();
                         var columnValue = o.GetValue("ColumnValue").Value<string>();
                         var data = (JObject)o.GetValue("Data");
 
@@ -90,15 +90,23 @@ namespace Howlett.Kafka.Extensions.Experiment
                     {
                         var action = (ActionType)o.GetValue("Action").Value<int>();
                         var columnValue = o.GetValue("ColumnValue").Value<string>();
-                        var data = (JObject)o.GetValue("Data");
                         var sourceColumnName = o.GetValue("SourceColumnName").Value<string>();
                         var sourceColumnValue = o.GetValue("SourceColumnValue").Value<string>();
-
-                        Dictionary<string, string> dataAsDict = new Dictionary<string, string>();
-                        foreach (var v in data.Descendants())
+                        JObject data = null;
+                        if (o.TryGetValue("Data", out JToken d))
                         {
-                            if (v.GetType() != typeof(JProperty)) continue;
-                            dataAsDict.Add(((JProperty)v).Name, ((JProperty)v).Value.ToString());
+                            data = (JObject)d;
+                        }
+
+                        Dictionary<string, string> dataAsDict = null;
+                        if (data != null)
+                        {
+                            dataAsDict = new Dictionary<string, string>();
+                            foreach (var v in data.Descendants())
+                            {
+                                if (v.GetType() != typeof(JProperty)) continue;
+                                dataAsDict.Add(((JProperty)v).Name, ((JProperty)v).Value.ToString());
+                            }
                         }
 
                         return new Command_Exit
@@ -132,7 +140,7 @@ namespace Howlett.Kafka.Extensions.Experiment
     public class Command_Change : Command
     {
         public override CommandType CommandType { get => CommandType.Change; }
-        public AddOrUpdate ChangeType { get; set; }
+        public ChangeType ChangeType { get; set; }
         public string ColumnValue { get; set; } // column name is implicit.
         public Dictionary<string, string> Data { get; set; }
     }

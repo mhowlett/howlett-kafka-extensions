@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace Howlett.Kafka.Extensions.Experiment
 {
-    public class InProgressState
+    public class InProgressState_Active
     {
         public Offset ChangeCommandOffset { get; set; }
         public string ColumnValue { get; set; }
@@ -13,6 +13,11 @@ namespace Howlett.Kafka.Extensions.Experiment
         public Dictionary<string, string> ToDelete { get; set; }
         public Dictionary<string, string> ToSet { get; set; }
         public Dictionary<string, string> OldData { get; set; }
-        public bool Verified = true;
+        public List<NameAndValue> VerifyFailed { get; set; }
+    }
+
+    public class InProgressState_Secondary
+    {
+        public Offset EnterCommandOffset { get; set; }
     }
 }

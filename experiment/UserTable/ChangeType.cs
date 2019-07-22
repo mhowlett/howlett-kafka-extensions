@@ -1,9 +1,10 @@
 namespace Howlett.Kafka.Extensions.Experiment
 {
-    public enum AddOrUpdate
+    public enum ChangeType
     {
         Add,
         Update,
-        AddOrUpdate
+        AddOrUpdate,
+        Delete
     }
 }

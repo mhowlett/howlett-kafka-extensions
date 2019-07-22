@@ -1,4 +1,3 @@
-using System.Reactive;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -30,6 +29,8 @@ namespace Howlett.Kafka.Extensions.Experiment
 
     public class ColumnPartition : IDisposable
     {
+        private static JsonSerializerSettings jsonSettings = new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore };
+
         private TimeSpan defaultTimeoutMs = TimeSpan.FromSeconds(10);
 
         private TableSpecification tableSpecification;
@@ -37,6 +38,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         private int partition;
         private int numPartitions;
         private string columnName;
+        private bool logCommands;
 
         private IProducer<Null, string> cmdProducer;
         private IProducer<string, string> clProducer;
@@ -65,7 +67,8 @@ namespace Howlett.Kafka.Extensions.Experiment
                 // EnableAutoOffsetStore = false,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
                 GroupId = tableSpecification.ChangeLogTopicName(this.columnName) + "_cg",
-                EnablePartitionEof = true
+                EnablePartitionEof = true,
+                FetchWaitMaxMs = 10
             };
             changeLogConsumer = new ConsumerBuilder<string, string>(cConfig1).Build();
 
@@ -75,21 +78,29 @@ namespace Howlett.Kafka.Extensions.Experiment
                 // EnableAutoCommit = true,
                 // EnableAutoOffsetStore = false,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
-                GroupId = tableSpecification.CommandTopicName(this.columnName) + "_cg"
+                GroupId = tableSpecification.CommandTopicName(this.columnName) + "_cg",
+                FetchWaitMaxMs = 10
             };
-            if (columnName == "username" && partition == 2)
-            {
-             //   cConfig2.Debug = "all";
-            }
             commandConsumer = new ConsumerBuilder<Null, string>(cConfig2)
-                .SetPartitionsAssignedHandler((c, ps) => {
-                    return new [] { new TopicPartitionOffset(this.tableSpecification.CommandTopicName(this.columnName), this.partition, Offset.Unset) };
-                })
+                .SetPartitionsAssignedHandler((c, ps) => new [] { 
+                    new TopicPartitionOffset(
+                        this.tableSpecification.CommandTopicName(this.columnName),
+                        this.partition,
+                        Offset.Unset) })
                 .Build();
         }
 
-        public ColumnPartition(TableSpecification tableSpecification, string bootstrapServers, string columnName, int partition, int numPartitions, bool recreate, CancellationToken ct)
+        public ColumnPartition(
+            TableSpecification tableSpecification,
+            string bootstrapServers,
+            string columnName,
+            int partition,
+            int numPartitions,
+            bool recreate,
+            bool logCommands,
+            CancellationToken ct)
         {
+            this.logCommands = logCommands;
             this.tableSpecification = tableSpecification;
             this.otherUniqueColumns = tableSpecification.ColumnSpecifications.Where(s => s.Unique && s.Name != columnName).ToList();
             this.partition = partition;
@@ -120,8 +131,12 @@ namespace Howlett.Kafka.Extensions.Experiment
         // materialized state for this column. columnValue: rowData.
         private Dictionary<string, Dictionary<string, string>> materialized = new Dictionary<string, Dictionary<string, string>>();
 
-        // correlation: WaitingForVerify info.
-        private Dictionary<string, InProgressState> inProgressState = new Dictionary<string, InProgressState>();
+        // correlation: in-progress state for commands for which this is the active key.
+        private Dictionary<string, InProgressState_Active> inProgressState_Active = new Dictionary<string, InProgressState_Active>();
+
+        // correlation: in-progress state for commands for which this is not the active key.
+        private Dictionary<string, InProgressState_Secondary> inProgressState_Secondary = new Dictionary<string, InProgressState_Secondary>();
+        
 
         // columnValue: correlation. correlation allows for de-duping.
         private Dictionary<string, string> locked = new Dictionary<string, string>();
@@ -167,7 +182,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         /// </summary>
         private void HandleChange(Command_Change cmd, Offset offset)
         {
-            if (inProgressState.ContainsKey(cmd.Correlation))
+            if (inProgressState_Active.ContainsKey(cmd.Correlation))
             {
                 // if the command_change message is received more than once, this is a duplicate
                 // message in the log and can simply be ignored.
@@ -183,7 +198,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             }
 
             // also abort if this is an add operation and the value exists already.
-            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.AddOrUpdate.Add &&
+            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.ChangeType.Add &&
                 this.materialized.ContainsKey(cmd.ColumnValue))
             {
                 CompleteChangeRequest(cmd.Correlation,new Exception($"key {cmd.ColumnValue} exists, can't add [{cmd.Correlation}]"));
@@ -191,7 +206,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             }
 
             // also abort if this is an update operation and the value doesn't exist already.
-            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.AddOrUpdate.Update &&
+            if (cmd.ChangeType == Howlett.Kafka.Extensions.Experiment.ChangeType.Update &&
                 !this.materialized.ContainsKey(cmd.ColumnValue))
             {
                 CompleteChangeRequest(cmd.Correlation, new Exception($"key {cmd.ColumnValue} doesn't exists, can't update [{cmd.Correlation}]"));
@@ -200,7 +215,7 @@ namespace Howlett.Kafka.Extensions.Experiment
 
             // AddOrUpdate can be dis-ambiguated at this point, and is not considered further
             // in the workflow.
-            var isAddCommand = !materialized.ContainsKey(cmd.ColumnValue) || cmd.ChangeType == Experiment.AddOrUpdate.Add;
+            var isAddCommand = !materialized.ContainsKey(cmd.ColumnValue) || cmd.ChangeType == Experiment.ChangeType.Add;
 
             var amalgamatedData = new Dictionary<string, string>(cmd.Data);
             var uniqueColumnValuesToDelete = new Dictionary<string, string>();
@@ -232,7 +247,7 @@ namespace Howlett.Kafka.Extensions.Experiment
                     {
                         if (cmd.Data[other.Name] != materialized[cmd.ColumnValue][other.Name])
                         {
-                            uniqueColumnValuesToDelete.Add(other.Name, cmd.Data[other.Name]);
+                            uniqueColumnValuesToDelete.Add(other.Name, this.materialized[cmd.ColumnValue][other.Name]);
                         }
                     }
                 }
@@ -260,7 +275,7 @@ namespace Howlett.Kafka.Extensions.Experiment
                 .Concat(uniqueColumnValuesToDelete.ToList())
                 .Select(a => new NameAndValue { Name = a.Key, Value = a.Value })
                 .ToList();
-            inProgressState.Add(cmd.Correlation, new InProgressState
+            inProgressState_Active.Add(cmd.Correlation, new InProgressState_Active
                 { 
                     ChangeCommandOffset = offset,
                     ColumnValue = cmd.ColumnValue,
@@ -269,12 +284,12 @@ namespace Howlett.Kafka.Extensions.Experiment
                     Data = amalgamatedData,
                     ToDelete = uniqueColumnValuesToDelete,
                     ToSet = otherUniqueColumns.Select(a => new KeyValuePair<string, string>(a.Name, amalgamatedData[a.Name])).ToDictionary(a => a.Key, a => a.Value),
-                    Verified = true // results from other column partitions get &'d together.
+                    VerifyFailed = new List<NameAndValue>()
                 });
 
             // finally, send an enter command to the relevant key/values
             // that need locking.
-            foreach (var cs in inProgressState[cmd.Correlation].WaitingVerify)
+            foreach (var cs in inProgressState_Active[cmd.Correlation].WaitingVerify)
             {
                 var enterCommand = new Command_Enter
                 {
@@ -292,7 +307,7 @@ namespace Howlett.Kafka.Extensions.Experiment
 
                 // TODO: verify producer settings ensure in order, gapless produce.
                 //       with a long retry.
-                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(enterCommand, Formatting.Indented) })
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(enterCommand, Formatting.Indented, jsonSettings) })
                     .FailIfFaulted("CHANGE", $"A fatal problem occured writing a lock command.");
             }
         }
@@ -348,19 +363,27 @@ namespace Howlett.Kafka.Extensions.Experiment
                 tableSpecification.CommandTopicName(cmd.SourceColumnName),
                 Table.Partitioner(cmd.SourceColumnValue, numPartitions));
 
-            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(verifyCommand, Formatting.Indented) })
+            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(verifyCommand, Formatting.Indented, jsonSettings) })
                 .FailIfFaulted("ENTER", $"A fatal problem occured writing a verify command.");
 
-            locked.Add(cmd.ColumnValue, cmd.Correlation);
+            // locking is only required if the value may possibly be changing.
+            if (canChange)
+            {
+                // lock the value until the command is complete [this may not be necessary].
+                locked.Add(cmd.ColumnValue, cmd.Correlation);
 
-            // don't allow commit until exit.
-            blockedForCommit.Add(offset, cmd.Correlation);
+                // don't allow commit until corresponding exit command
+                blockedForCommit.Add(offset, cmd.Correlation);
+
+                // remember the offset, to remove from blockedForCommit on exit.
+                inProgressState_Secondary.Add(cmd.Correlation, new InProgressState_Secondary { EnterCommandOffset = offset });
+            }
         }
 
 
         private void HandleVerify(Command_Verify cmd, Offset offset)
         {
-            if (!inProgressState.ContainsKey(cmd.Correlation))
+            if (!inProgressState_Active.ContainsKey(cmd.Correlation))
             {
                 // This could occur in the case of duplicate writes and can be safely ignored.
                 Logger.Log("VERIFY", $"Received verify command with no corresponding waitingVerify entry, ignoring [{cmd.Correlation}]");
@@ -368,15 +391,18 @@ namespace Howlett.Kafka.Extensions.Experiment
             }
 
             // all verify results must be true for command to succeed.
-            inProgressState[cmd.Correlation].Verified &= cmd.Verified;
+            if (!cmd.Verified)
+            {
+                inProgressState_Active[cmd.Correlation].VerifyFailed.Add(new NameAndValue { Name=cmd.SourceColumnName, Value=cmd.SourceColumnValue });
+            }
 
             // remove the received column from list we're waiting on.
-            inProgressState[cmd.Correlation].WaitingVerify = inProgressState[cmd.Correlation]
+            inProgressState_Active[cmd.Correlation].WaitingVerify = inProgressState_Active[cmd.Correlation]
                 .WaitingVerify.Where(a => !(a.Name == cmd.SourceColumnName && a.Value == cmd.SourceColumnValue))
                 .ToList();
 
             // if we're waiting on more, then there's nothing left to do here.
-            if (inProgressState[cmd.Correlation].WaitingVerify.Count > 0)
+            if (inProgressState_Active[cmd.Correlation].WaitingVerify.Count > 0)
             {
                 return;
             }
@@ -385,14 +411,15 @@ namespace Howlett.Kafka.Extensions.Experiment
             // --- verification result has been received for all columns.
             // Logger.Log("VERIFY", $"All verify commands received for: [{cmd.Correlation}]");
 
-            var inProgress = inProgressState[cmd.Correlation];
+            var inProgress = inProgressState_Active[cmd.Correlation];
+            var aborting = inProgress.VerifyFailed.Count > 0;
 
-
-            // send exit commands for columns that are to be set (or abort).
+            // send exit_commands for columns that are to be set (or abort).
+            // note: does not include the current "this" column - that is handled as a special case.
             foreach (var col in inProgress.ToSet)
             {
                 Dictionary<string, string> dataToSet = null;
-                if (inProgressState[cmd.Correlation].Verified)
+                if (!aborting)
                 {
                     dataToSet = new Dictionary<string, string>(inProgress.Data);
                     dataToSet.Add(this.columnName, inProgress.ColumnValue);
@@ -403,7 +430,7 @@ namespace Howlett.Kafka.Extensions.Experiment
                 {
                     Correlation = cmd.Correlation,
                     ColumnValue = inProgress.Data[col.Key],
-                    Action = inProgress.Verified ? ActionType.Set : ActionType.Abort,
+                    Action = aborting ? ActionType.Abort : ActionType.Set,
                     Data = dataToSet,
                     SourceColumnName = this.columnName,
                     SourceColumnValue = inProgress.ColumnValue
@@ -413,18 +440,18 @@ namespace Howlett.Kafka.Extensions.Experiment
                     tableSpecification.CommandTopicName(col.Key),
                     Table.Partitioner(exitCommand.ColumnValue, this.numPartitions));
 
-                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented) })
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented, jsonSettings) })
                     .FailIfFaulted("VERIFY", "produce fail");
             }
         
-            // send exit commands for column values that are to be deleted (or abort).
+            // send exit_commands for column values that are to be deleted (or abort).
             foreach (var col in inProgress.ToDelete)
             {
                 var exitCommand = new Command_Exit
                 {
                     Correlation = cmd.Correlation,
-                    ColumnValue = inProgress.Data[col.Key],
-                    Action = inProgress.Verified ? ActionType.Delete : ActionType.Abort,
+                    ColumnValue = col.Value,
+                    Action = aborting ? ActionType.Abort : ActionType.Delete,
                     Data = null,
                     SourceColumnName = this.columnName,
                     SourceColumnValue = inProgress.ColumnValue
@@ -434,15 +461,17 @@ namespace Howlett.Kafka.Extensions.Experiment
                     tableSpecification.CommandTopicName(col.Key),
                     Table.Partitioner(exitCommand.ColumnValue, this.numPartitions));
 
-                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented) })
+                cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(exitCommand, Formatting.Indented, jsonSettings) })
                     .FailIfFaulted("VERIFY", "produce fail");
             }
 
-            // if aborting, complete now - there will be no acks.
-            if (!inProgressState[cmd.Correlation].Verified)
+            // if aborting, clean up everything now - there will be no acks.
+            if (aborting)
             {
+                locked.Remove(inProgress.ColumnValue);
+                blockedForCommit.Remove(inProgress.ChangeCommandOffset);
+                inProgressState_Active.Remove(cmd.Correlation);
                 CompleteChangeRequest(cmd.Correlation, new Exception("columns verify failed"));
-                inProgressState.Remove(cmd.Correlation);
                 return;
             }
         }
@@ -453,20 +482,25 @@ namespace Howlett.Kafka.Extensions.Experiment
             {
                 if (locked[cmd.ColumnValue] != cmd.Correlation)
                 {
-                    Logger.Log("EXIT", "correlation doesn't match, unlocking. [{cmd.Correlation}]. expecting: [{locked[cmd.ColumnValue]}]");
+                    Logger.Log("EXIT", $"correlation doesn't match, unlocking. [{cmd.Correlation}]. expecting: [{locked[cmd.ColumnValue]}]");
                     System.Environment.Exit(1);
                 }
             }
 
-            // after this handler, the value is no longer locked
+            // unlock, whether aborted or not.
             locked.Remove(cmd.ColumnValue);
+
             // also, offset is free to progress.
-            blockedForCommit.Remove(offset);
+            var inProgress = inProgressState_Secondary[cmd.Correlation]; // TODO: some validation around this.
+
+            blockedForCommit.Remove(inProgress.EnterCommandOffset);
+
+            inProgressState_Secondary.Remove(cmd.Correlation);
 
             // if the command is aborting, then no ack is expected and we're done.
             if (cmd.Action == ActionType.Abort)
             {
-                Logger.Log("EXIT", "Command aborted [{cmd.Correlation}]");
+                // Logger.Log("EXIT", $"Command aborted [{cmd.Correlation}]");
                 return;
             }
 
@@ -478,8 +512,8 @@ namespace Howlett.Kafka.Extensions.Experiment
 
             if (cmd.Action == ActionType.Set)
             {
-                clProducer.ProduceAsync(tp, new Message<string, string> { Key = cmd.ColumnValue, Value = JsonConvert.SerializeObject(cmd.Data, Formatting.Indented) })
-                    .FailIfFaulted("EXIT", "failed to write to changelog");
+                clProducer.ProduceAsync(tp, new Message<string, string> { Key = cmd.ColumnValue, Value = JsonConvert.SerializeObject(cmd.Data, Formatting.Indented, jsonSettings) })
+                    .FailIfFaulted("EXIT", $"failed to write to changelog [{cmd.Correlation}]");
 
                 if (materialized.ContainsKey(cmd.ColumnValue))
                 {
@@ -518,7 +552,7 @@ namespace Howlett.Kafka.Extensions.Experiment
                 this.tableSpecification.CommandTopicName(cmd.SourceColumnName),
                 Table.Partitioner(cmd.SourceColumnValue, this.numPartitions));
 
-            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(ackCommand, Formatting.Indented) })
+            cmdProducer.ProduceAsync(tp, new Message<Null, string> { Value = JsonConvert.SerializeObject(ackCommand, Formatting.Indented, jsonSettings) })
                 .FailIfFaulted("EXIT", "failed to write ack cmd [{cmd.Correlation}]");
         }
 
@@ -526,7 +560,7 @@ namespace Howlett.Kafka.Extensions.Experiment
         private void HandleAck(Command_Ack cmd, Offset offset)
         {
             // always expect the state corresponding to an ack to exist.
-            if (!this.inProgressState.ContainsKey(cmd.Correlation))
+            if (!this.inProgressState_Active.ContainsKey(cmd.Correlation))
             {
                 Logger.Log("ACK", $"ERROR!: Ack correlation not found [{cmd.Correlation}]");
 
@@ -539,7 +573,7 @@ namespace Howlett.Kafka.Extensions.Experiment
                 return;
             }
 
-            var inProgress = this.inProgressState[cmd.Correlation];
+            var inProgress = this.inProgressState_Active[cmd.Correlation];
 
             // it's ok if this doesn't exist - may reflect a de-dupe.
             if (inProgress.WaitingAck.Where(a => a.Name == cmd.SourceColumnName && a.Value == cmd.SourceColumnValue).Count() == 1)
@@ -558,10 +592,29 @@ namespace Howlett.Kafka.Extensions.Experiment
                 return;
             }
 
-            locked.Remove(inProgress.ColumnValue);
-            blockedForCommit.Remove(offset);
-            this.inProgressState.Remove(cmd.Correlation);
+            // finally add data to change log topic (special case for this column).
+            var tp = new TopicPartition(
+                    this.tableSpecification.ChangeLogTopicName(this.columnName),
+                    Table.Partitioner(inProgress.ColumnValue, this.numPartitions));
 
+            clProducer.ProduceAsync(tp, new Message<string, string> { Key = inProgress.ColumnValue, Value = JsonConvert.SerializeObject(inProgress.Data, Formatting.Indented, jsonSettings) })
+                .FailIfFaulted("EXIT", "failed to write to changelog");
+
+            if (materialized.ContainsKey(inProgress.ColumnValue))
+            {
+                materialized[inProgress.ColumnValue] = inProgress.Data;
+            }
+            else
+            {
+                materialized.Add(inProgress.ColumnValue, inProgress.Data);
+            }
+
+            // unlock, allow commit & remove state.
+            locked.Remove(inProgress.ColumnValue);
+            blockedForCommit.Remove(inProgressState_Active[cmd.Correlation].ChangeCommandOffset);
+            this.inProgressState_Active.Remove(cmd.Correlation);
+
+            // finally signal that we're done.
             CompleteChangeRequest(cmd.Correlation, null);
         }
 
@@ -585,9 +638,8 @@ namespace Howlett.Kafka.Extensions.Experiment
                         }
                         commandConsumer.Commit(cr);
 
-                        var o = (JObject)JsonConvert.DeserializeObject(cr.Value);
-                        var cmd = Command.Extract(o);
-                        Command.Log(cmd, this.columnName, this.partition);
+                        var cmd = Command.Extract((JObject)JsonConvert.DeserializeObject(cr.Value));
+                        if (this.logCommands) { Command.Log(cmd, this.columnName, this.partition); }
                         switch(cmd.CommandType)
                         {
                             case CommandType.Change:
@@ -653,52 +705,23 @@ namespace Howlett.Kafka.Extensions.Experiment
                     // materialize.
                     var columnValue = cr.Key;
                     var columnName = this.columnName;
-                    var o = (JObject)JsonConvert.DeserializeObject(cr.Value);
-                    Dictionary<string, string> dataAsDict = new Dictionary<string, string>();
-                    foreach (var v in o.Descendants())
+                    if (cr.Value == null)
                     {
-                        if (v.GetType() != typeof(JProperty)) continue;
-                        dataAsDict.Add(((JProperty)v).Name, ((JProperty)v).Value.ToString());
+                        // materialized.Remove(columnValue);
                     }
-
-                    var correlation = dataAsDict["_correlation"];
-                    var sourceColumn = dataAsDict["_sourceColumn"];
-                    var sourceValue = dataAsDict["_sourceValue"];
-
-                    dataAsDict.Remove("_correlation");
-                    dataAsDict.Remove("_sourceColumn");
-                    dataAsDict.Remove("_sourceValue");
-
-                    materialized.Add(columnValue, dataAsDict);
-
-                    if (this.columnName != sourceColumn)
+                    else
                     {
-                        var ackCommand = new Command_Ack
+                        var o = (JObject)JsonConvert.DeserializeObject(cr.Value);
+                        Dictionary<string, string> dataAsDict = new Dictionary<string, string>();
+                        foreach (var v in o.Descendants())
                         {
-                            Correlation = correlation,
-                            SourceColumnName = columnName
-                        };
-
-                        var tp = new TopicPartition(
-                            tableSpecification.CommandTopicName(sourceColumn),
-                            Table.Partitioner(sourceValue, numPartitions)
-                        );
-
-                        cmdProducer.ProduceAsync(
-                            tp,
-                            new Message<Null, string>
-                            {
-                                Value = JsonConvert.SerializeObject(ackCommand, Formatting.Indented)
-                            }
-                        ).ContinueWith(r => 
-                            {
-                                if (r.IsFaulted)
-                                {
-                                    Console.WriteLine("produce failed");
-                                    System.Environment.Exit(1);
-                                }
-                            });
+                            if (v.GetType() != typeof(JProperty)) continue;
+                            dataAsDict.Add(((JProperty)v).Name, ((JProperty)v).Value.ToString());
+                        }
                     }
+
+                    // TODO: only read from CL on startup. else maybe check? 
+                    // materialized.Add(columnValue, dataAsDict);
                 }
             });
 
@@ -715,7 +738,7 @@ namespace Howlett.Kafka.Extensions.Experiment
             return await tcs.Task.ConfigureAwait(false);
         }
 
-        public async Task<bool> AddOrUpdate(AddOrUpdate changeType, string keyValue, Dictionary<string, string> row)
+        public async Task<bool> Change(ChangeType changeType, string keyValue, Dictionary<string, string> row)
         {
             var keyName = this.columnName;
             var p = Table.Partitioner(keyValue, this.numPartitions);
@@ -739,10 +762,7 @@ namespace Howlett.Kafka.Extensions.Experiment
 
             var r = await cmdProducer.ProduceAsync(
                 new TopicPartition(tableSpecification.CommandTopicName(this.columnName), this.partition),
-                new Message<Null, string>
-                {
-                    Value = JsonConvert.SerializeObject(changeCommand, Formatting.Indented)
-                }
+                new Message<Null, string> { Value = JsonConvert.SerializeObject(changeCommand, Formatting.Indented, jsonSettings) }
             );
 
             return await WaitForResult(changeCommand.Correlation).ConfigureAwait(false);
@@ -754,9 +774,24 @@ namespace Howlett.Kafka.Extensions.Experiment
             {
                 return materialized[keyValue];
             }
+
             return null;
         }
-        
+
+        public Dictionary<string, string> GetMetrics()
+        {
+            var result = new Dictionary<string, string>();
+            result.Add("column.name", this.columnName);
+            result.Add("partition.id", this.partition.ToString());
+            result.Add("materialized.count", materialized.Count.ToString());
+            result.Add("locked.count", locked.Count.ToString());
+            result.Add("blocked.for.commit.count", blockedForCommit.Count.ToString());
+            result.Add("in.progress.state.active.count", inProgressState_Active.Count.ToString());
+            result.Add("in.progress.state.secondary.count", inProgressState_Secondary.Count.ToString());
+            result.Add("in.progress.tasks.count", inProgressTasks.Count.ToString());
+            return result;
+        }
+
         public void Dispose()
         {
             cmdProducer.Dispose();
